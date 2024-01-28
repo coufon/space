@@ -22,12 +22,13 @@ from typing import (Any, Callable, Dict, Iterator, List, Optional,
 
 from absl import logging  # type: ignore[import-untyped]
 from ray.data.block import Block, BlockMetadata
+from ray.data._internal.remote_fn import cached_remote_fn
 from ray.data.datasource.datasource import Datasource, Reader, ReadTask
-from ray.data.datasource.datasource import WriteResult
-from ray.types import ObjectRef
 
 from space.core.ops.read import FileSetReadOp
+from space.core.ops.utils import FileOptions
 from space.core.options import ReadOptions
+import space.core.proto.metadata_pb2 as meta
 import space.core.proto.runtime_pb2 as rt
 from space.ray.options import RayOptions
 
@@ -36,7 +37,7 @@ if TYPE_CHECKING:
 
 
 class SpaceDataSource(Datasource):
-  """A Ray data source for a Space dataset."""
+  """A Ray data source for Space datasets."""
 
   # pylint: disable=arguments-differ,too-many-arguments
   def create_reader(  # type: ignore[override]
@@ -47,17 +48,6 @@ class SpaceDataSource(Datasource):
       file_set: Optional[rt.FileSet] = None,
   ) -> Reader:
     return _SpaceDataSourceReader(storage, ray_options, read_options, file_set)
-
-  def do_write(self, blocks: List[ObjectRef[Block]],
-               metadata: List[BlockMetadata],
-               ray_remote_args: Optional[Dict[str, Any]],
-               location: str) -> List[ObjectRef[WriteResult]]:
-    """Write a Ray dataset into Space datasets."""
-    raise NotImplementedError("Write from a Ray dataset is not supported")
-
-  def on_write_complete(  # type: ignore[override]
-      self, write_results: List[WriteResult]) -> None:
-    raise NotImplementedError("Write from a Ray dataset is not supported")
 
 
 class _SpaceDataSourceReader(Reader):
@@ -149,3 +139,24 @@ def _block_metadata(num_rows: Optional[int]) -> BlockMetadata:
       input_files=None,
       exec_stats=None,
   )
+
+
+def _write_single_block(location: str, metadata: meta.StorageMetadata,
+                        block: Block) -> Optional[rt.Patch]:
+  if (block.num_rows == 0):
+    return None
+
+  from space.core import datasets
+  ds = datasets.load_dataset(location)
+  metadata = ds.metadata()
+
+  append_op = AppendOp(metadata)
+  append_op.append(block)
+
+  return append_op.finish()
+
+  op = RayAppendOp(self._storage.location, self._storage.metadata, ray_options,
+                   self._file_options)
+  op.write_from(source_fns)
+
+  return op.finish()

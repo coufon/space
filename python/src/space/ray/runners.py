@@ -108,6 +108,24 @@ class RayReadOnlyRunner(BaseReadOnlyRunner):
         if data.num_rows > 0:
           yield ChangeData(change.snapshot_id, change.type_, data)
 
+  def diff_ray(self,
+               start_version: Union[Version],
+               end_version: Union[Version],
+               batch_size: Optional[int] = None) -> Iterator[ChangeData]:
+    self._source_storage.reload()
+    source_changes = read_change_data(
+        self._source_storage,
+        self._source_storage.version_to_snapshot_id(start_version),
+        self._source_storage.version_to_snapshot_id(end_version),
+        self._ray_options, ReadOptions(batch_size=batch_size))
+
+    for change in source_changes:
+      # TODO: skip processing the data for deletions; the caller is usually
+      # only interested at deleted primary keys.
+      # TODO: to split change data into chunks for parallel processing.
+      yield ChangeData(change.snapshot_id, change.type_,
+                       self._view.process_source(change.data))
+
   @property
   def _source_storage(self) -> Storage:
     """Obtain the single storage of the source dataset, never write to it."""
@@ -121,8 +139,8 @@ class RayMaterializedViewRunner(RayReadOnlyRunner, StorageMixin):
                file_options: Optional[FileOptions]):
     RayReadOnlyRunner.__init__(self, mv.view, ray_options)
     StorageMixin.__init__(self, mv.storage)
-    self._file_options = file_options or FileOptions()
     self._ray_options = ray_options or RayOptions()
+    self._file_options = file_options or FileOptions()
 
   # pylint: disable=too-many-arguments
   @StorageMixin.reload
@@ -177,7 +195,7 @@ class RayMaterializedViewRunner(RayReadOnlyRunner, StorageMixin):
     previous_snapshot_id: Optional[int] = None
 
     txn = self._start_txn()
-    for change in self.diff(start_snapshot_id, end_snapshot_id, batch_size):
+    for change in self.diff_ray(start_snapshot_id, end_snapshot_id, batch_size):
       # Commit when changes from the same snapshot end.
       if (previous_snapshot_id is not None and
           change.snapshot_id != previous_snapshot_id):
@@ -223,11 +241,17 @@ class RayMaterializedViewRunner(RayReadOnlyRunner, StorageMixin):
                          self._file_options)
     return op.delete()
 
-  def _process_append(self, data: pa.Table) -> Optional[rt.Patch]:
-    # TODO: to use RayAppendOp.
-    op = LocalAppendOp(self._storage.location, self._storage.metadata,
-                       self._file_options)
-    op.write(data)
+  def _process_append(self, data: ray.data.Dataset) -> Optional[rt.Patch]:
+    its = data.streaming_split(self._ray_options.max_parallelism, equal=False)
+
+    source_fns = []
+    for it in its:
+      source_fns.append(
+          lambda: it.iter_batches(batch_size=None, batch_format="pyarrow"))
+
+    op = RayAppendOp(self._storage.location, self._storage.metadata,
+                     self._ray_options, self._file_options)
+    op.write_from(source_fns)
     return op.finish()
 
   def _start_txn(self) -> Transaction:
@@ -267,7 +291,20 @@ class RayReadWriterRunner(RayReadOnlyRunner, BaseReadWriteRunner):
     op = RayAppendOp(self._storage.location, self._storage.metadata,
                      ray_options, self._file_options)
     op.write_from(source_fns)
+    return op.finish()
 
+  @StorageMixin.transactional
+  def append_ray(self, data: ray.data.Dataset) -> Optional[rt.Patch]:
+    its = data.streaming_split(self._ray_options.max_parallelism, equal=False)
+
+    source_fns = []
+    for it in its:
+      source_fns.append(
+          lambda: it.iter_batches(batch_size=None, batch_format="pyarrow"))
+
+    op = RayAppendOp(self._storage.location, self._storage.metadata,
+                     self._ray_options, self._file_options)
+    op.write_from(source_fns)
     return op.finish()
 
   @StorageMixin.transactional
